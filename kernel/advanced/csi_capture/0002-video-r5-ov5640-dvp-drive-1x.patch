@@ -1,0 +1,47 @@
+From: IMX6ULL AV Project <learning-project@local>
+Subject: [PATCH] media: ov5640: use 1x DVP output drive strength
+
+The NXP 4.1.15 OV5640 driver programs register 0x302c[7:6] for 2x
+output drive strength after every mode initialization.  On the ALIENTEK
+i.MX6ULL camera interface, VGA YUYV at 30 fps showed motion-dependent line
+displacement with 2x drive strength.  Raising the setting to 3x and 4x made
+the displacement progressively worse, while 1x removed it completely.
+
+The 1x setting was validated with 54,000 dynamically changing frames at
+30.02 fps.  There were no driver sequence gaps, timeouts, stale-frame drops
+or CSI errors, and register readback after capture still reported 1x.
+
+This monotonic dependence on output drive is consistent with excessive
+edge rate causing overshoot, ringing or crosstalk on this board-level DVP
+connection.  Keep the CSI receiver on its proven rising PCLK edge and use
+the lowest stable OV5640 drive setting.
+
+---
+ drivers/media/platform/mxc/capture/ov5640.c | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/platform/mxc/capture/ov5640.c b/drivers/media/platform/mxc/capture/ov5640.c
+--- a/drivers/media/platform/mxc/capture/ov5640.c
++++ b/drivers/media/platform/mxc/capture/ov5640.c
+@@ -1062,10 +1062,16 @@ static int ov5640_init_mode(void)
+ 	if (retval < 0)
+ 		goto err;
+ 
+-	/* change driver capability to 2x according to validation board.
+-	 * if the image is not stable, please increase the driver strength.
++	/*
++	 * The ALIENTEK i.MX6ULL parallel DVP connection is stable at 1x.
++	 * VGA/30-fps motion tests showed line displacement at 2x; 3x and 4x
++	 * made it progressively worse.  A 54,000-frame dynamic test at 1x
++	 * completed at 30.02 fps without visual corruption, sequence gaps,
++	 * timeouts or CSI errors.  The monotonic drive-strength dependence
++	 * points to excessive edge rate and board-level signal integrity,
++	 * so do not use the original validation-board value of 2x here.
+ 	 */
+-	ov5640_driver_capability(2);
++	ov5640_driver_capability(1);
+ 	ov5640_set_bandingfilter();
+ 	ov5640_set_AE_target(AE_Target);
+ 	ov5640_set_night_mode(night_mode);
+-- 
+2.7.4

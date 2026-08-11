@@ -1,0 +1,62 @@
+From: IMX6ULL AV Project <learning-project@local>
+Subject: [DIAGNOSTIC] media: mx6s-csi: sample parallel PCLK on falling edge
+
+This patch is an A/B diagnostic for the VIDEO-R5 natural-image corruption
+seen at VGA 30 fps.  The original NXP 4.1.15 driver sets BIT_REDGE and samples
+the parallel CSI bus on the rising PCLK edge.  Clear BIT_REDGE in variant B so
+that the receiver samples on the falling edge.
+
+Keep the sensor format, timing and polarity registers unchanged while testing.
+This patch is deliberately not the final product configuration: if variant B
+is proven better on hardware, a later cleanup will expose the edge selection
+as a device-tree property instead of leaving it hard-coded.
+
+The second change keeps the same edge if the driver ever leaves TV-decoder
+mode.  VGA progressive capture does not normally execute that path, but
+covering it prevents a future mode change from silently restoring REDGE.
+
+---
+ drivers/media/platform/mxc/subdev/mx6s_capture.c | 15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/mxc/subdev/mx6s_capture.c b/drivers/media/platform/mxc/subdev/mx6s_capture.c
+index 1111111..2222222 100644
+--- a/drivers/media/platform/mxc/subdev/mx6s_capture.c
++++ b/drivers/media/platform/mxc/subdev/mx6s_capture.c
+@@ -457,7 +457,14 @@ static void csi_init_interface(struct mx6s_csi_dev *csi_dev)
+ 	unsigned int imag_para;
+ 
+ 	val |= BIT_SOF_POL;
+-	val |= BIT_REDGE;
++	/*
++	 * VIDEO-R5 PCLK edge A/B test, variant B:
++	 *
++	 * BIT_REDGE=1 selects rising-edge sampling.  Keep it cleared here so
++	 * the CSI receiver samples the OV5640 parallel bus on the falling edge.
++	 * Do not change OV5640 timing/polarity registers during this test.
++	 */
++	val &= ~BIT_REDGE;
+ 	val |= BIT_GCLK_MODE;
+ 	val |= BIT_HSYNC_POL;
+ 	val |= BIT_FCC;
+@@ -555,6 +562,8 @@ static void csi_tvdec_enable(struct mx6s_csi_dev *csi_dev, bool enable)
+ 				BIT_BASEADDR_CHG_ERR_EN);
+ 		cr1 &= ~BIT_CCIR_MODE;
+-		cr1 |= BIT_SOF_POL | BIT_REDGE;
++		cr1 |= BIT_SOF_POL;
++		/* Preserve VIDEO-R5 variant B after leaving TV-decoder mode. */
++		cr1 &= ~BIT_REDGE;
+ 	}
+ 
+ 	__raw_writel(cr18, csi_dev->regbase + CSI_CSICR18);
+@@ -1172,6 +1181,8 @@ static int mx6s_csi_open(struct file *file)
+ 
+ 	v4l2_subdev_call(sd, core, s_power, 1);
+ 	mx6s_csi_init(csi_dev);
++	dev_info(csi_dev->dev,
++		 "VIDEO-R5 A/B: parallel PCLK sampling edge = falling\n");
+ 
+ 	mutex_unlock(&csi_dev->lock);
+ 
+-- 
+2.7.4

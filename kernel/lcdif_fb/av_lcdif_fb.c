@@ -1,0 +1,1611 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * av_lcdif_fb.c - i.MX6ULL LCDIF learning driver, round LCD-R5
+ *
+ * LCD-R5是LCD模块的稳定性收尾轮次，在已经通过实机验证的R4基础上
+ * 新增：
+ *   1. 实现FBIOBLANK，停止/恢复LCDIF并保留当前显示页；
+ *   2. 常开underflow/overflow异常中断，只计数、不刷屏；
+ *   3. 提供只读lcdif_stats sysfs节点，输出运行状态和寄存器；
+ *   4. 用state_lock串行化blank、pan和VSYNC硬件状态转换；
+ *   5. fb_test增加blank恢复测试，文档增加重复加载稳定性验收。
+ *
+ * 最终驱动保持固定1024x600 RGB565和两帧显存，不支持动态改
+ * 分辨率、像素格式、x方向平移或YWRAP。
+ */
+
+#include <linux/clk.h>
+#include <linux/completion.h>
+#include <linux/console.h>
+#include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/dma-mapping.h>
+#include <linux/err.h>
+#include <linux/fb.h>
+#include <linux/interrupt.h>
+#include <linux/io.h>
+#include <linux/ioport.h>
+#include <linux/jiffies.h>
+#include <linux/kernel.h>
+#include <linux/mm.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/of_device.h>
+#include <linux/pinctrl/consumer.h>
+#include <linux/platform_device.h>
+#include <linux/slab.h>
+
+#define AV_LCDIF_DRIVER_NAME		"av-lcdif-fb"
+
+/*
+ * i.MX LCDIF寄存器支持SET/CLR/TOG别名：
+ *
+ *     base + offset + 0x0：普通寄存器
+ *     base + offset + 0x4：写1置位对应bit
+ *     base + offset + 0x8：写1清除对应bit
+ *     base + offset + 0xc：写1翻转对应bit
+ *
+ * 使用SET/CLR修改单个控制位，可以避免“read-modify-write”期间误改
+ * 硬件自动更新的状态位。
+ */
+#define REG_SET				0x04
+#define REG_CLR				0x08
+
+/* i.MX6ULL使用LCDIF v4寄存器布局。 */
+#define LCDC_CTRL			0x000
+#define LCDC_CTRL1			0x010
+#define LCDC_V4_CTRL2			0x020
+#define LCDC_V4_TRANSFER_COUNT		0x030
+#define LCDC_V4_CUR_BUF			0x040
+#define LCDC_V4_NEXT_BUF		0x050
+#define LCDC_VDCTRL0			0x070
+#define LCDC_VDCTRL1			0x080
+#define LCDC_VDCTRL2			0x090
+#define LCDC_VDCTRL3			0x0a0
+#define LCDC_VDCTRL4			0x0b0
+
+/* LCDC_CTRL */
+#define CTRL_BYPASS_COUNT		(1U << 19)
+#define CTRL_DOTCLK_MODE		(1U << 17)
+#define CTRL_SET_BUS_WIDTH(x)		(((x) & 0x3U) << 10)
+#define CTRL_SET_WORD_LENGTH(x)		(((x) & 0x3U) << 8)
+#define CTRL_MASTER			(1U << 5)
+#define CTRL_RUN			(1U << 0)
+
+/*
+ * CTRL的总线宽度编码不是直接写8/16/18/24：
+ *   0 -> 16-bit, 1 -> 8-bit, 2 -> 18-bit, 3 -> 24-bit
+ */
+#define STMLCDIF_24BIT			3U
+
+/*
+ * CTRL的word length编码0表示16-bit像素。当前Framebuffer格式固定
+ * RGB565，所以一个像素占两个字节。
+ */
+#define STMLCDIF_WORD_LENGTH_16		0U
+
+/* LCDC_CTRL1 */
+#define CTRL1_RECOVERY_ON_UNDERFLOW	(1U << 24)
+#define CTRL1_FIFO_CLEAR		(1U << 21)
+#define CTRL1_SET_BYTE_PACKAGING(x)	(((x) & 0xfU) << 16)
+#define CTRL1_OVERFLOW_IRQ_EN		(1U << 15)
+#define CTRL1_UNDERFLOW_IRQ_EN		(1U << 14)
+#define CTRL1_CUR_FRAME_DONE_IRQ_EN	(1U << 13)
+#define CTRL1_VSYNC_EDGE_IRQ_EN		(1U << 12)
+#define CTRL1_OVERFLOW_IRQ		(1U << 11)
+#define CTRL1_UNDERFLOW_IRQ		(1U << 10)
+#define CTRL1_CUR_FRAME_DONE_IRQ	(1U << 9)
+#define CTRL1_VSYNC_EDGE_IRQ		(1U << 8)
+#define CTRL1_IRQ_ENABLE_MASK		(CTRL1_OVERFLOW_IRQ_EN | \
+					 CTRL1_UNDERFLOW_IRQ_EN | \
+					 CTRL1_CUR_FRAME_DONE_IRQ_EN | \
+					 CTRL1_VSYNC_EDGE_IRQ_EN)
+#define CTRL1_IRQ_STATUS_MASK		(CTRL1_OVERFLOW_IRQ | \
+					 CTRL1_UNDERFLOW_IRQ | \
+					 CTRL1_CUR_FRAME_DONE_IRQ | \
+					 CTRL1_VSYNC_EDGE_IRQ)
+
+/* LCDC_CTRL2：最多允许16个未完成的AXI读请求，提高扫描吞吐量。 */
+#define CTRL2_OUTSTANDING_REQS_16	(3U << 21)
+
+/* TRANSFER_COUNT：高16位是有效行数，低16位是每行有效像素数。 */
+#define TRANSFER_COUNT_VCOUNT(x)	(((x) & 0xffffU) << 16)
+#define TRANSFER_COUNT_HCOUNT(x)	((x) & 0xffffU)
+
+/* LCDC_VDCTRL0 */
+#define VDCTRL0_ENABLE_PRESENT		(1U << 28)
+#define VDCTRL0_VSYNC_ACT_HIGH		(1U << 27)
+#define VDCTRL0_HSYNC_ACT_HIGH		(1U << 26)
+#define VDCTRL0_DOTCLK_ACT_FALLING	(1U << 25)
+#define VDCTRL0_ENABLE_ACT_HIGH		(1U << 24)
+#define VDCTRL0_VSYNC_PERIOD_UNIT	(1U << 21)
+#define VDCTRL0_VSYNC_PULSE_WIDTH_UNIT	(1U << 20)
+#define VDCTRL0_VSYNC_PULSE_WIDTH(x)	((x) & 0x3ffffU)
+
+/* LCDC_VDCTRL2，LCDIF v4的HSYNC宽度位于[31:18]。 */
+#define VDCTRL2_HSYNC_PULSE_WIDTH(x)	(((x) & 0x3fffU) << 18)
+#define VDCTRL2_HSYNC_PERIOD(x)		((x) & 0x3ffffU)
+
+/* LCDC_VDCTRL3 */
+#define VDCTRL3_HORIZONTAL_WAIT(x)	(((x) & 0xfffU) << 16)
+#define VDCTRL3_VERTICAL_WAIT(x)	((x) & 0xffffU)
+
+/* LCDC_VDCTRL4 */
+#define VDCTRL4_SYNC_SIGNALS_ON		(1U << 18)
+#define VDCTRL4_VALID_DATA_COUNT(x)	((x) & 0x3ffffU)
+
+#define AV_LCDIF_BYTES_PER_PIXEL	2U
+#define AV_LCDIF_BUFFER_COUNT		2U
+#define AV_LCDIF_COLOR_BAR_COUNT	8U
+#define AV_LCDIF_STOP_RETRIES		1000U
+#define AV_LCDIF_FLIP_TIMEOUT		(HZ / 2)
+#define AV_LCDIF_VSYNC_TIMEOUT		(HZ / 2)
+
+/*
+ * 从设备树读取的面板时序。
+ *
+ * active：真正显示图像的像素或行。
+ * front porch：有效区结束到同步脉冲开始之间的空白区。
+ * sync len：HSYNC/VSYNC脉冲宽度。
+ * back porch：同步脉冲结束到下一有效区开始之间的空白区。
+ *
+ * 一行总时钟数：
+ *   hactive + hfront_porch + hsync_len + hback_porch
+ *
+ * 一帧总行数：
+ *   vactive + vfront_porch + vsync_len + vback_porch
+ */
+struct av_lcdif_timing {
+	u32 pixelclock;
+
+	u32 hactive;
+	u32 hfront_porch;
+	u32 hback_porch;
+	u32 hsync_len;
+
+	u32 vactive;
+	u32 vfront_porch;
+	u32 vback_porch;
+	u32 vsync_len;
+
+	u32 hsync_active;
+	u32 vsync_active;
+	u32 de_active;
+	u32 pixelclk_active;
+};
+
+/*
+ * 每个LCDIF硬件实例对应一个结构体。
+ *
+ * fb_virt：
+ *   CPU在内核中填充颜色条所使用的虚拟地址。
+ * fb_dma：
+ *   LCDIF DMA读取显存使用的总线地址，写入NEXT_BUF寄存器。
+ * frame_size/fb_size：
+ *   一帧是1024 * 600 * 2 = 1,228,800 bytes；连续申请两帧，
+ *   因此总显存为2,457,600 bytes。连续布局允许通过yoffset选择页。
+ *
+ * flip_complete/vsync_complete：
+ *   中断处理函数不能睡眠，只负责清中断并complete；发起ioctl的进程
+ *   在completion上睡眠，避免轮询寄存器浪费CPU。
+ *
+ * flip_lock/vsync_lock：
+ *   同一种硬件事件同时只能有一个等待者。两个mutex分别串行化翻页
+ *   和VSYNC等待，但允许二者并行等待不同的中断位。
+ *
+ * clocks_enabled/controller_enabled：
+ *   记录资源当前状态，保证probe错误路径和remove只释放已经成功取得
+ *   的资源，并严格遵循“先停DMA，再关时钟，最后释放显存”的顺序。
+ */
+struct av_lcdif {
+	struct device *dev;
+	void __iomem *regs;
+	int irq;
+
+	struct clk *clk_pix;
+	struct clk *clk_axi;
+	struct clk *clk_disp_axi;
+
+	u32 bus_width;
+	u32 bits_per_pixel;
+	struct av_lcdif_timing timing;
+
+	void *fb_virt;
+	dma_addr_t fb_dma;
+	dma_addr_t scanout_dma;
+	size_t frame_size;
+	size_t fb_size;
+	struct fb_info *fb_info;
+	u32 pseudo_palette[16];
+
+	struct completion flip_complete;
+	struct completion vsync_complete;
+	struct mutex flip_lock;
+	struct mutex vsync_lock;
+	struct mutex state_lock;
+	u32 completed_flips;
+	u32 completed_vsyncs;
+	u32 underflows;
+	u32 overflows;
+	u32 blank_events;
+	int blank_state;
+
+	bool clk_pix_enabled;
+	bool clk_axi_enabled;
+	bool clk_disp_axi_enabled;
+	bool controller_enabled;
+	bool framebuffer_registered;
+	bool irq_registered;
+	bool stats_file_created;
+};
+
+static int av_lcdif_start_controller(struct av_lcdif *lcdif);
+static void av_lcdif_stop_controller(struct av_lcdif *lcdif);
+
+/*
+ * 当前板级DTS的时序属性都是单个u32。把错误日志集中在这个函数中，
+ * 可以在设备树缺少属性时明确指出具体名字。
+ */
+static int av_lcdif_read_u32(struct device *dev, struct device_node *np,
+			     const char *property, u32 *value)
+{
+	int ret;
+
+	ret = of_property_read_u32(np, property, value);
+	if (ret)
+		dev_err(dev, "timing node %s has no valid %s\n",
+			np->full_name, property);
+
+	return ret;
+}
+
+/*
+ * 解析关系：
+ *
+ * lcdif node --display phandle--> display0
+ * display0/display-timings --native-mode phandle--> timing0
+ *
+ * 不按“display”或“timing0”的字符串直接搜索最终节点，从而尊重DTS
+ * 中明确指定的引用关系。
+ */
+static int av_lcdif_parse_display(struct platform_device *pdev,
+				   struct av_lcdif *lcdif)
+{
+	struct av_lcdif_timing *t = &lcdif->timing;
+	struct device_node *display_np = NULL;
+	struct device_node *timings_np = NULL;
+	struct device_node *timing_np = NULL;
+	u32 htotal;
+	u32 vtotal;
+	u32 refresh_hz;
+	int ret;
+
+	display_np = of_parse_phandle(pdev->dev.of_node, "display", 0);
+	if (!display_np) {
+		dev_err(&pdev->dev, "missing display phandle\n");
+		return -EINVAL;
+	}
+
+	ret = of_property_read_u32(display_np, "bus-width",
+				   &lcdif->bus_width);
+	if (ret) {
+		dev_err(&pdev->dev, "display node has no bus-width\n");
+		goto out_put_nodes;
+	}
+
+	ret = of_property_read_u32(display_np, "bits-per-pixel",
+				   &lcdif->bits_per_pixel);
+	if (ret) {
+		dev_err(&pdev->dev, "display node has no bits-per-pixel\n");
+		goto out_put_nodes;
+	}
+
+	if (lcdif->bus_width != 24 || lcdif->bits_per_pixel != 16) {
+		dev_err(&pdev->dev,
+			"unsupported panel: bus-width=%u, bpp=%u\n",
+			lcdif->bus_width, lcdif->bits_per_pixel);
+		ret = -EINVAL;
+		goto out_put_nodes;
+	}
+
+	timings_np = of_get_child_by_name(display_np, "display-timings");
+	if (!timings_np) {
+		dev_err(&pdev->dev, "display node has no display-timings\n");
+		ret = -EINVAL;
+		goto out_put_nodes;
+	}
+
+	timing_np = of_parse_phandle(timings_np, "native-mode", 0);
+	if (!timing_np) {
+		/*
+		 * 当前DTS存在native-mode。保留“第一个子节点”回退路径，
+		 * 便于以后使用只有一个timing但没有native-mode的面板。
+		 */
+		timing_np = of_get_next_child(timings_np, NULL);
+	}
+	if (!timing_np) {
+		dev_err(&pdev->dev, "display-timings has no timing entry\n");
+		ret = -EINVAL;
+		goto out_put_nodes;
+	}
+
+#define READ_TIMING(_name, _member)					\
+	do {								\
+		ret = av_lcdif_read_u32(&pdev->dev, timing_np,		\
+					 _name, &t->_member);		\
+		if (ret)						\
+			goto out_put_nodes;				\
+	} while (0)
+
+	READ_TIMING("clock-frequency", pixelclock);
+	READ_TIMING("hactive", hactive);
+	READ_TIMING("hfront-porch", hfront_porch);
+	READ_TIMING("hback-porch", hback_porch);
+	READ_TIMING("hsync-len", hsync_len);
+	READ_TIMING("vactive", vactive);
+	READ_TIMING("vfront-porch", vfront_porch);
+	READ_TIMING("vback-porch", vback_porch);
+	READ_TIMING("vsync-len", vsync_len);
+	READ_TIMING("hsync-active", hsync_active);
+	READ_TIMING("vsync-active", vsync_active);
+	READ_TIMING("de-active", de_active);
+	READ_TIMING("pixelclk-active", pixelclk_active);
+
+#undef READ_TIMING
+
+	/*
+	 * R2只接受已经确认的1024x600面板。以后支持其他面板时，应改为
+	 * 控制器能力范围检查，而不是保留这个固定分辨率判断。
+	 */
+	if (t->hactive != 1024 || t->vactive != 600) {
+		dev_err(&pdev->dev, "unexpected resolution %ux%u\n",
+			t->hactive, t->vactive);
+		ret = -EINVAL;
+		goto out_put_nodes;
+	}
+
+	if (!t->pixelclock || !t->hsync_len || !t->vsync_len) {
+		dev_err(&pdev->dev, "invalid zero value in display timing\n");
+		ret = -EINVAL;
+		goto out_put_nodes;
+	}
+
+	if (t->hsync_active > 1 || t->vsync_active > 1 ||
+	    t->de_active > 1 || t->pixelclk_active > 1) {
+		dev_err(&pdev->dev, "display polarity must be 0 or 1\n");
+		ret = -EINVAL;
+		goto out_put_nodes;
+	}
+
+	htotal = t->hactive + t->hfront_porch +
+		 t->hsync_len + t->hback_porch;
+	vtotal = t->vactive + t->vfront_porch +
+		 t->vsync_len + t->vback_porch;
+	refresh_hz = t->pixelclock / (htotal * vtotal);
+
+	dev_info(&pdev->dev,
+		 "timing %s: %ux%u, pixelclock=%u Hz, refresh~%u Hz\n",
+		 timing_np->full_name, t->hactive, t->vactive,
+		 t->pixelclock, refresh_hz);
+	dev_info(&pdev->dev,
+		 "horizontal: active=%u front=%u sync=%u back=%u total=%u\n",
+		 t->hactive, t->hfront_porch, t->hsync_len,
+		 t->hback_porch, htotal);
+	dev_info(&pdev->dev,
+		 "vertical: active=%u front=%u sync=%u back=%u total=%u\n",
+		 t->vactive, t->vfront_porch, t->vsync_len,
+		 t->vback_porch, vtotal);
+	dev_info(&pdev->dev,
+		 "polarity: hsync=%u vsync=%u de=%u pixelclk=%u\n",
+		 t->hsync_active, t->vsync_active,
+		 t->de_active, t->pixelclk_active);
+
+	ret = 0;
+
+out_put_nodes:
+	of_node_put(timing_np);
+	of_node_put(timings_np);
+	of_node_put(display_np);
+	return ret;
+}
+
+/*
+ * 使能时钟前先设置像素时钟频率。旧版NXP驱动也要求在pix clock关闭
+ * 状态下调用clk_set_rate()，否则时钟树可能拒绝改频。
+ */
+static int av_lcdif_enable_clocks(struct av_lcdif *lcdif)
+{
+	unsigned long requested = lcdif->timing.pixelclock;
+	unsigned long actual;
+	unsigned long difference;
+	int ret;
+
+	ret = clk_set_rate(lcdif->clk_pix, requested);
+	if (ret) {
+		dev_err(lcdif->dev, "failed to set pix clock to %lu Hz: %d\n",
+			requested, ret);
+		return ret;
+	}
+
+	ret = clk_prepare_enable(lcdif->clk_axi);
+	if (ret) {
+		dev_err(lcdif->dev, "failed to enable axi clock: %d\n", ret);
+		return ret;
+	}
+	lcdif->clk_axi_enabled = true;
+
+	ret = clk_prepare_enable(lcdif->clk_disp_axi);
+	if (ret) {
+		dev_err(lcdif->dev,
+			"failed to enable disp_axi clock: %d\n", ret);
+		goto disable_axi;
+	}
+	lcdif->clk_disp_axi_enabled = true;
+
+	ret = clk_prepare_enable(lcdif->clk_pix);
+	if (ret) {
+		dev_err(lcdif->dev, "failed to enable pix clock: %d\n", ret);
+		goto disable_disp_axi;
+	}
+	lcdif->clk_pix_enabled = true;
+
+	actual = clk_get_rate(lcdif->clk_pix);
+	difference = actual > requested ? actual - requested :
+		     requested - actual;
+
+	dev_info(lcdif->dev,
+		 "clock rates: requested pix=%lu Hz, actual pix=%lu Hz, "
+		 "axi=%lu Hz, disp_axi=%lu Hz\n",
+		 requested, actual, clk_get_rate(lcdif->clk_axi),
+		 clk_get_rate(lcdif->clk_disp_axi));
+
+	/* 允许clock framework产生小量舍入，超过1%则明确警告。 */
+	if (difference > requested / 100)
+		dev_warn(lcdif->dev,
+			 "actual pixel clock differs from request by >1%%\n");
+
+	return 0;
+
+disable_disp_axi:
+	clk_disable_unprepare(lcdif->clk_disp_axi);
+	lcdif->clk_disp_axi_enabled = false;
+disable_axi:
+	clk_disable_unprepare(lcdif->clk_axi);
+	lcdif->clk_axi_enabled = false;
+	return ret;
+}
+
+static void av_lcdif_disable_clocks(struct av_lcdif *lcdif)
+{
+	if (lcdif->clk_pix_enabled) {
+		clk_disable_unprepare(lcdif->clk_pix);
+		lcdif->clk_pix_enabled = false;
+	}
+
+	if (lcdif->clk_disp_axi_enabled) {
+		clk_disable_unprepare(lcdif->clk_disp_axi);
+		lcdif->clk_disp_axi_enabled = false;
+	}
+
+	if (lcdif->clk_axi_enabled) {
+		clk_disable_unprepare(lcdif->clk_axi);
+		lcdif->clk_axi_enabled = false;
+	}
+}
+
+/*
+ * RGB565布局：
+ *
+ *   bit[15:11] Red
+ *   bit[10:5]  Green
+ *   bit[4:0]   Blue
+ *
+ * 8条颜色从左到右是白、黄、青、绿、品红、红、蓝、黑。若颜色顺序
+ * 或分量明显错误，后续应检查像素位域、字节序和LCD数据线连接。
+ */
+static void av_lcdif_fill_color_bars(struct av_lcdif *lcdif,
+				      unsigned int page)
+{
+	static const u16 colors[AV_LCDIF_COLOR_BAR_COUNT] = {
+		0xffff,	/* white */
+		0xffe0,	/* yellow */
+		0x07ff,	/* cyan */
+		0x07e0,	/* green */
+		0xf81f,	/* magenta */
+		0xf800,	/* red */
+		0x001f,	/* blue */
+		0x0000,	/* black */
+	};
+	const u32 width = lcdif->timing.hactive;
+	const u32 height = lcdif->timing.vactive;
+	u8 *page_base = (u8 *)lcdif->fb_virt + page * lcdif->frame_size;
+	u16 *pixels = (u16 *)page_base;
+	u32 x;
+	u32 y;
+
+	for (y = 0; y < height; y++) {
+		for (x = 0; x < width; x++) {
+			u32 bar = (x * AV_LCDIF_COLOR_BAR_COUNT) / width;
+
+			pixels[y * width + x] = colors[bar];
+		}
+	}
+
+}
+
+/*
+ * 第二页预置棋盘图。probe后LCDIF仍从第0页色条开始扫描；第1页只是
+ * 为第一次手工翻页提供一个容易分辨的目标画面。
+ */
+static void av_lcdif_fill_checker(struct av_lcdif *lcdif,
+				   unsigned int page)
+{
+	const u16 light = 0xef7d;
+	const u16 dark = 0x11f1;
+	const u32 block = 64;
+	const u32 width = lcdif->timing.hactive;
+	const u32 height = lcdif->timing.vactive;
+	u8 *page_base = (u8 *)lcdif->fb_virt + page * lcdif->frame_size;
+	u16 *pixels = (u16 *)page_base;
+	u32 x;
+	u32 y;
+
+	for (y = 0; y < height; y++) {
+		for (x = 0; x < width; x++) {
+			u32 cell = (x / block) + (y / block);
+
+			pixels[y * width + x] = (cell & 1U) ? dark : light;
+		}
+	}
+}
+
+static int av_lcdif_alloc_framebuffer(struct av_lcdif *lcdif)
+{
+	lcdif->frame_size = lcdif->timing.hactive *
+			    lcdif->timing.vactive *
+			    AV_LCDIF_BYTES_PER_PIXEL;
+	lcdif->fb_size = lcdif->frame_size * AV_LCDIF_BUFFER_COUNT;
+
+	lcdif->fb_virt = dma_alloc_writecombine(lcdif->dev,
+						lcdif->fb_size,
+						&lcdif->fb_dma,
+						GFP_KERNEL | GFP_DMA);
+	if (!lcdif->fb_virt) {
+		dev_err(lcdif->dev,
+			"failed to allocate %zu-byte DMA framebuffer\n",
+			lcdif->fb_size);
+		return -ENOMEM;
+	}
+	lcdif->scanout_dma = lcdif->fb_dma;
+
+	dev_info(lcdif->dev,
+		 "DMA framebuffer: cpu=%p, dma=0x%08llx, "
+		 "frame=%zu bytes, total=%zu bytes (%u buffers)\n",
+		 lcdif->fb_virt, (unsigned long long)lcdif->fb_dma,
+		 lcdif->frame_size, lcdif->fb_size,
+		 AV_LCDIF_BUFFER_COUNT);
+
+	av_lcdif_fill_color_bars(lcdif, 0);
+	av_lcdif_fill_checker(lcdif, 1);
+
+	/*
+	 * dma_alloc_writecombine()返回的内存对设备是DMA一致的。wmb()确保
+	 * 两页初始化写入在启动LCDIF DMA之前已经对外可见。
+	 */
+	wmb();
+	return 0;
+}
+
+static void av_lcdif_free_framebuffer(struct av_lcdif *lcdif)
+{
+	if (!lcdif->fb_virt)
+		return;
+
+	dma_free_writecombine(lcdif->dev, lcdif->fb_size,
+			      lcdif->fb_virt, lcdif->fb_dma);
+	lcdif->fb_virt = NULL;
+	lcdif->fb_dma = (dma_addr_t)0;
+	lcdif->scanout_dma = (dma_addr_t)0;
+	lcdif->frame_size = 0;
+	lcdif->fb_size = 0;
+}
+
+/*
+ * fbdev的颜色参数使用16-bit无符号范围0x0000～0xffff，而RGB565显存
+ * 只保留5/6/5位。该函数按fb_bitfield描述完成截断和移位。
+ */
+static u32 av_lcdif_chan_to_field(u32 channel,
+				   const struct fb_bitfield *field)
+{
+	channel &= 0xffffU;
+	channel >>= 16 - field->length;
+	return channel << field->offset;
+}
+
+/*
+ * R5不允许改变可见分辨率、像素格式和xoffset；虚拟高度固定为
+ * 两帧，yoffset允许0～600。硬件实际上能从任意行地址开始扫描，因此
+ * ypanstep为1，不过fb_test只使用0和600两个完整页面。
+ */
+static int av_lcdif_fb_check_var(struct fb_var_screeninfo *var,
+				  struct fb_info *info)
+{
+	struct av_lcdif *lcdif = info->par;
+	u32 virtual_height = lcdif->timing.vactive *
+			     AV_LCDIF_BUFFER_COUNT;
+
+	if (var->xres != lcdif->timing.hactive ||
+	    var->yres != lcdif->timing.vactive ||
+	    var->xres_virtual != lcdif->timing.hactive ||
+	    var->yres_virtual != virtual_height ||
+	    var->bits_per_pixel != 16 ||
+	    var->xoffset != 0 ||
+	    var->yoffset > virtual_height - lcdif->timing.vactive ||
+	    (var->vmode & FB_VMODE_YWRAP))
+		return -EINVAL;
+
+	/* 固定为RGB565：R5、G6、B5，没有透明通道。 */
+	var->red.offset = 11;
+	var->red.length = 5;
+	var->red.msb_right = 0;
+	var->green.offset = 5;
+	var->green.length = 6;
+	var->green.msb_right = 0;
+	var->blue.offset = 0;
+	var->blue.length = 5;
+	var->blue.msb_right = 0;
+	var->transp.offset = 0;
+	var->transp.length = 0;
+	var->transp.msb_right = 0;
+
+	return 0;
+}
+
+/*
+ * 当前显示模式在probe时已经写入LCDIF，R5不允许动态改模式。因此
+ * set_par只再次验证info->var并维护line_length，不重启控制器。
+ */
+static int av_lcdif_fb_set_par(struct fb_info *info)
+{
+	int ret;
+
+	ret = av_lcdif_fb_check_var(&info->var, info);
+	if (ret)
+		return ret;
+
+	info->fix.line_length = info->var.xres *
+				(info->var.bits_per_pixel / 8);
+	return 0;
+}
+
+/*
+ * TrueColor模式没有硬件调色板，但fbcon等fbdev用户仍会设置前16个
+ * “颜色寄存器”。驱动把计算结果保存到pseudo_palette，cfb_fillrect
+ * 和cfb_imageblit会使用这16个值。
+ */
+static int av_lcdif_fb_setcolreg(unsigned int regno, unsigned int red,
+				  unsigned int green, unsigned int blue,
+				  unsigned int transp,
+				  struct fb_info *info)
+{
+	u32 value;
+	u32 *palette = info->pseudo_palette;
+
+	if (regno >= 16)
+		return -EINVAL;
+
+	if (info->var.grayscale)
+		red = green = blue =
+			(19595U * red + 38470U * green + 7471U * blue) >> 16;
+
+	value = av_lcdif_chan_to_field(red, &info->var.red);
+	value |= av_lcdif_chan_to_field(green, &info->var.green);
+	value |= av_lcdif_chan_to_field(blue, &info->var.blue);
+	value |= av_lcdif_chan_to_field(transp, &info->var.transp);
+	palette[regno] = value;
+
+	return 0;
+}
+
+/*
+ * 用户程序调用mmap(/dev/fb0)时，不能使用普通匿名内存映射。这里必须
+ * 以与dma_alloc_writecombine()一致的write-combine属性，把同一组
+ * 物理页映射到用户进程。否则CPU缓存属性不一致可能导致画面不更新。
+ */
+static int av_lcdif_fb_mmap(struct fb_info *info,
+			    struct vm_area_struct *vma)
+{
+	struct av_lcdif *lcdif = info->par;
+	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
+	unsigned long length = vma->vm_end - vma->vm_start;
+
+	if (offset >= lcdif->fb_size ||
+	    length > lcdif->fb_size - offset)
+		return -EINVAL;
+
+	return dma_mmap_writecombine(lcdif->dev, vma,
+				     lcdif->fb_virt, lcdif->fb_dma,
+				     lcdif->fb_size);
+}
+
+/*
+ * LCDIF只在对应的IRQ_EN位置1时才把状态送到CPU。中断处理函数同时
+ * 检查“使能位+状态位”，清除本次状态并关闭一次性使能，然后唤醒
+ * 等待进程。每次pan或wait-vsync都会重新使能所需事件。
+ *
+ * 不在这里打印每帧日志，否则60Hz中断会迅速淹没串口并干扰实时性。
+ */
+static irqreturn_t av_lcdif_irq_handler(int irq, void *data)
+{
+	struct av_lcdif *lcdif = data;
+	u32 ctrl1;
+	bool handled = false;
+
+	(void)irq;
+	ctrl1 = readl(lcdif->regs + LCDC_CTRL1);
+
+	if ((ctrl1 & CTRL1_CUR_FRAME_DONE_IRQ_EN) &&
+	    (ctrl1 & CTRL1_CUR_FRAME_DONE_IRQ)) {
+		writel(CTRL1_CUR_FRAME_DONE_IRQ,
+		       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+		writel(CTRL1_CUR_FRAME_DONE_IRQ_EN,
+		       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+		lcdif->completed_flips++;
+		complete(&lcdif->flip_complete);
+		handled = true;
+	}
+
+	if ((ctrl1 & CTRL1_VSYNC_EDGE_IRQ_EN) &&
+	    (ctrl1 & CTRL1_VSYNC_EDGE_IRQ)) {
+		writel(CTRL1_VSYNC_EDGE_IRQ,
+		       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+		writel(CTRL1_VSYNC_EDGE_IRQ_EN,
+		       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+		lcdif->completed_vsyncs++;
+		complete(&lcdif->vsync_complete);
+		handled = true;
+	}
+
+	/*
+	 * underflow表示LCDIF FIFO来不及取得下一批像素，overflow表示
+	 * 数据到达速度异常。R5让这两个诊断中断常开，handler只清状态并
+	 * 计数，不在高频路径打印日志，避免故障时形成中断+串口风暴。
+	 */
+	if ((ctrl1 & CTRL1_UNDERFLOW_IRQ_EN) &&
+	    (ctrl1 & CTRL1_UNDERFLOW_IRQ)) {
+		writel(CTRL1_UNDERFLOW_IRQ,
+		       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+		lcdif->underflows++;
+		handled = true;
+	}
+
+	if ((ctrl1 & CTRL1_OVERFLOW_IRQ_EN) &&
+	    (ctrl1 & CTRL1_OVERFLOW_IRQ)) {
+		writel(CTRL1_OVERFLOW_IRQ,
+		       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+		lcdif->overflows++;
+		handled = true;
+	}
+
+	return handled ? IRQ_HANDLED : IRQ_NONE;
+}
+
+/*
+ * FBIOPAN_DISPLAY并不搬运像素，只改变下一帧的DMA起始地址：
+ *
+ *   next_dma = framebuffer_dma + yoffset * line_length
+ *
+ * 写NEXT_BUF后，LCDIF在帧边界把它装载为CUR_BUF。CUR_FRAME_DONE中断
+ * 表明这次地址切换已经跨过完整帧边界，此时ioctl才返回给应用。
+ */
+static int av_lcdif_fb_pan_display(struct fb_var_screeninfo *var,
+				    struct fb_info *info)
+{
+	struct av_lcdif *lcdif = info->par;
+	dma_addr_t next_dma;
+	unsigned long completed;
+	int ret = 0;
+
+	if (var->xoffset != 0 ||
+	    var->yoffset > info->var.yres_virtual - info->var.yres)
+		return -EINVAL;
+
+	ret = mutex_lock_interruptible(&lcdif->flip_lock);
+	if (ret)
+		return ret;
+
+	ret = mutex_lock_interruptible(&lcdif->state_lock);
+	if (ret)
+		goto unlock_flip;
+
+	if (!lcdif->controller_enabled || !lcdif->irq_registered) {
+		ret = -EBUSY;
+		goto unlock_state;
+	}
+
+	next_dma = lcdif->fb_dma +
+		   (dma_addr_t)var->yoffset * info->fix.line_length;
+
+	/*
+	 * 应用在write-combine映射中完成后备帧绘制后才进入ioctl。wmb()
+	 * 保证像素写入先于NEXT_BUF更新被LCDIF观察到。
+	 */
+	wmb();
+	reinit_completion(&lcdif->flip_complete);
+
+	/*
+	 * 先写NEXT_BUF，再清旧状态，最后开中断。若恰好在清状态之前跨过
+	 * 帧边界，最多多等一帧，不会把旧状态误判成本次翻页完成。
+	 */
+	writel((u32)next_dma, lcdif->regs + LCDC_V4_NEXT_BUF);
+	writel(CTRL1_CUR_FRAME_DONE_IRQ,
+	       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+	writel(CTRL1_CUR_FRAME_DONE_IRQ_EN,
+	       lcdif->regs + LCDC_CTRL1 + REG_SET);
+
+	completed = wait_for_completion_timeout(&lcdif->flip_complete,
+						 AV_LCDIF_FLIP_TIMEOUT);
+	if (!completed) {
+		writel(CTRL1_CUR_FRAME_DONE_IRQ_EN,
+		       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+		writel(CTRL1_CUR_FRAME_DONE_IRQ,
+		       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+		dev_err(lcdif->dev,
+			"pan timeout: yoffset=%u next=0x%08llx "
+			"CUR=0x%08x CTRL1=0x%08x\n",
+			var->yoffset, (unsigned long long)next_dma,
+			readl(lcdif->regs + LCDC_V4_CUR_BUF),
+			readl(lcdif->regs + LCDC_CTRL1));
+		ret = -ETIMEDOUT;
+	} else {
+		lcdif->scanout_dma = next_dma;
+	}
+
+unlock_state:
+	mutex_unlock(&lcdif->state_lock);
+unlock_flip:
+	mutex_unlock(&lcdif->flip_lock);
+	return ret;
+}
+
+/*
+ * 标准FBIO_WAITFORVSYNC等待下一次VSYNC边沿。它与pan使用不同的
+ * completion和mutex，所以调试程序可以独立测量面板刷新率。
+ */
+static int av_lcdif_wait_for_vsync(struct fb_info *info)
+{
+	struct av_lcdif *lcdif = info->par;
+	long completed;
+	int ret;
+
+	ret = mutex_lock_interruptible(&lcdif->vsync_lock);
+	if (ret)
+		return ret;
+
+	ret = mutex_lock_interruptible(&lcdif->state_lock);
+	if (ret)
+		goto unlock_vsync;
+
+	if (!lcdif->controller_enabled || !lcdif->irq_registered) {
+		ret = -EBUSY;
+		goto unlock_state;
+	}
+
+	reinit_completion(&lcdif->vsync_complete);
+	writel(CTRL1_VSYNC_EDGE_IRQ,
+	       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+	writel(CTRL1_VSYNC_EDGE_IRQ_EN,
+	       lcdif->regs + LCDC_CTRL1 + REG_SET);
+
+	completed = wait_for_completion_interruptible_timeout(
+				&lcdif->vsync_complete,
+				AV_LCDIF_VSYNC_TIMEOUT);
+	if (completed == 0) {
+		dev_err(lcdif->dev, "wait for VSYNC timeout, CTRL1=0x%08x\n",
+			readl(lcdif->regs + LCDC_CTRL1));
+		ret = -ETIMEDOUT;
+	} else if (completed < 0) {
+		ret = (int)completed;
+	} else {
+		ret = 0;
+	}
+
+	if (completed <= 0) {
+		writel(CTRL1_VSYNC_EDGE_IRQ_EN,
+		       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+		writel(CTRL1_VSYNC_EDGE_IRQ,
+		       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+	}
+
+unlock_state:
+	mutex_unlock(&lcdif->state_lock);
+unlock_vsync:
+	mutex_unlock(&lcdif->vsync_lock);
+	return ret;
+}
+
+/*
+ * fbdev把所有非UNBLANK级别都视为“停止输出”。R5保留时钟和DMA显存，
+ * 只安全停止LCDIF；恢复时重新写整套寄存器，并从scanout_dma继续显示
+ * blank前的页面。这样显存内容不会因息屏丢失。
+ *
+ * 本板已有pwm-backlight设备。fb_blank成功返回后，fbdev core发送
+ * FB_EVENT_BLANK，backlight core会通过notifier关闭/恢复PWM背光，
+ * 因此本LCDIF驱动不需要越过框架直接操作PWM寄存器。
+ */
+static int av_lcdif_fb_blank(int blank, struct fb_info *info)
+{
+	struct av_lcdif *lcdif = info->par;
+	int ret = 0;
+
+	if (blank < FB_BLANK_UNBLANK || blank > FB_BLANK_POWERDOWN)
+		return -EINVAL;
+
+	ret = mutex_lock_interruptible(&lcdif->state_lock);
+	if (ret)
+		return ret;
+
+	if (blank == lcdif->blank_state)
+		goto unlock;
+
+	if (blank == FB_BLANK_UNBLANK) {
+		if (!lcdif->controller_enabled)
+			ret = av_lcdif_start_controller(lcdif);
+	} else {
+		if (lcdif->controller_enabled)
+			av_lcdif_stop_controller(lcdif);
+	}
+
+	if (!ret) {
+		lcdif->blank_state = blank;
+		lcdif->blank_events++;
+		dev_info(lcdif->dev, "blank state changed to %d\n", blank);
+	}
+
+unlock:
+	mutex_unlock(&lcdif->state_lock);
+	return ret;
+}
+
+static int av_lcdif_fb_ioctl(struct fb_info *info, unsigned int command,
+			      unsigned long argument)
+{
+	/*
+	 * FBIO_WAITFORVSYNC的argument用于选择CRTC。i.MX6ULL只有一个
+	 * LCDIF输出，因此忽略其数值，但保留标准ioctl编号。
+	 */
+	(void)argument;
+
+	switch (command) {
+	case FBIO_WAITFORVSYNC:
+		return av_lcdif_wait_for_vsync(info);
+	default:
+		return -ENOTTY;
+	}
+}
+
+static struct fb_ops av_lcdif_fb_ops = {
+	.owner = THIS_MODULE,
+	.fb_check_var = av_lcdif_fb_check_var,
+	.fb_set_par = av_lcdif_fb_set_par,
+	.fb_setcolreg = av_lcdif_fb_setcolreg,
+	.fb_blank = av_lcdif_fb_blank,
+	.fb_pan_display = av_lcdif_fb_pan_display,
+	.fb_ioctl = av_lcdif_fb_ioctl,
+	.fb_mmap = av_lcdif_fb_mmap,
+	.fb_fillrect = cfb_fillrect,
+	.fb_copyarea = cfb_copyarea,
+	.fb_imageblit = cfb_imageblit,
+};
+
+/*
+ * 用户通过FBIOBLANK发起请求时，fbdev core会在调用fb_blank()前依次
+ * 获取console_lock和fb_info锁。驱动在probe/remove/shutdown中主动
+ * 发布背光事件时绕过了ioctl入口，因此也必须遵守相同的锁顺序。
+ *
+ * Linux 4.1.15的fbcon blank notifier最终会进入VT层；如果没有持有
+ * console_lock，do_unblank_screen()会触发WARN_CONSOLE_UNLOCKED。
+ * 注意：锁只放在这个“驱动主动发布事件”的包装函数中，不能放进
+ * av_lcdif_fb_blank()回调，否则用户态FBIOBLANK路径会发生重复加锁。
+ */
+static int av_lcdif_publish_blank(struct fb_info *info, int blank)
+{
+	int ret;
+
+	console_lock();
+	if (!lock_fb_info(info)) {
+		console_unlock();
+		return -ENODEV;
+	}
+
+	ret = fb_blank(info, blank);
+
+	unlock_fb_info(info);
+	console_unlock();
+	return ret;
+}
+
+/*
+ * 将两帧连续DMA显存注册为Linux framebuffer。
+ *
+ * fix描述不随模式改变的硬件事实，例如显存地址和每行字节数。
+ * var描述当前可见模式，例如分辨率、porch和RGB位域。
+ */
+static int av_lcdif_register_framebuffer(struct av_lcdif *lcdif)
+{
+	const struct av_lcdif_timing *t = &lcdif->timing;
+	struct fb_info *info;
+	int ret;
+
+	info = framebuffer_alloc(0, lcdif->dev);
+	if (!info)
+		return -ENOMEM;
+
+	lcdif->fb_info = info;
+	info->par = lcdif;
+	info->fbops = &av_lcdif_fb_ops;
+	info->flags = FBINFO_FLAG_DEFAULT | FBINFO_READS_FAST;
+	info->pseudo_palette = lcdif->pseudo_palette;
+	info->screen_base = (char __iomem *)lcdif->fb_virt;
+	info->screen_size = lcdif->fb_size;
+	INIT_LIST_HEAD(&info->modelist);
+
+	snprintf(info->fix.id, sizeof(info->fix.id), "av-lcdif");
+	info->fix.smem_start = (unsigned long)lcdif->fb_dma;
+	info->fix.smem_len = lcdif->fb_size;
+	info->fix.type = FB_TYPE_PACKED_PIXELS;
+	info->fix.type_aux = 0;
+	info->fix.visual = FB_VISUAL_TRUECOLOR;
+	info->fix.xpanstep = 0;
+	info->fix.ypanstep = 1;
+	info->fix.ywrapstep = 0;
+	info->fix.line_length = t->hactive * AV_LCDIF_BYTES_PER_PIXEL;
+	info->fix.accel = FB_ACCEL_NONE;
+
+	info->var.xres = t->hactive;
+	info->var.yres = t->vactive;
+	info->var.xres_virtual = t->hactive;
+	info->var.yres_virtual = t->vactive * AV_LCDIF_BUFFER_COUNT;
+	info->var.xoffset = 0;
+	info->var.yoffset = 0;
+	info->var.bits_per_pixel = 16;
+	info->var.grayscale = 0;
+
+	info->var.red.offset = 11;
+	info->var.red.length = 5;
+	info->var.green.offset = 5;
+	info->var.green.length = 6;
+	info->var.blue.offset = 0;
+	info->var.blue.length = 5;
+	info->var.transp.offset = 0;
+	info->var.transp.length = 0;
+
+	/* fbdev中的pixclock单位是皮秒，而DTS使用Hz。 */
+	info->var.pixclock = KHZ2PICOS(t->pixelclock / 1000U);
+	info->var.left_margin = t->hback_porch;
+	info->var.right_margin = t->hfront_porch;
+	info->var.upper_margin = t->vback_porch;
+	info->var.lower_margin = t->vfront_porch;
+	info->var.hsync_len = t->hsync_len;
+	info->var.vsync_len = t->vsync_len;
+	info->var.sync = 0;
+	if (t->hsync_active)
+		info->var.sync |= FB_SYNC_HOR_HIGH_ACT;
+	if (t->vsync_active)
+		info->var.sync |= FB_SYNC_VERT_HIGH_ACT;
+	info->var.vmode = FB_VMODE_NONINTERLACED;
+	info->var.activate = FB_ACTIVATE_NOW;
+	info->var.height = -1;
+	info->var.width = -1;
+
+	ret = av_lcdif_fb_check_var(&info->var, info);
+	if (ret) {
+		dev_err(lcdif->dev,
+			"internal framebuffer mode validation failed: %d\n",
+			ret);
+		goto release_info;
+	}
+
+	ret = register_framebuffer(info);
+	if (ret) {
+		dev_err(lcdif->dev,
+			"failed to register framebuffer: %d\n", ret);
+		goto release_info;
+	}
+
+	lcdif->framebuffer_registered = true;
+
+	/*
+	 * 主动发布一次UNBLANK事件。现有pwm-backlight驱动通过fb notifier
+	 * 接收该事件，确保驱动重新加载后背光恢复到DTS默认亮度。
+	 */
+	ret = av_lcdif_publish_blank(info, FB_BLANK_UNBLANK);
+	if (ret)
+		dev_warn(lcdif->dev,
+			 "failed to publish initial UNBLANK event: %d\n", ret);
+
+	dev_info(lcdif->dev,
+		 "registered /dev/fb%d: visible=%ux%u, virtual=%ux%u "
+		 "RGB565, line=%u, memory=%u\n",
+		 info->node, info->var.xres, info->var.yres,
+		 info->var.xres_virtual, info->var.yres_virtual,
+		 info->fix.line_length, info->fix.smem_len);
+	return 0;
+
+release_info:
+	framebuffer_release(info);
+	lcdif->fb_info = NULL;
+	return ret;
+}
+
+static void av_lcdif_unregister_framebuffer(struct av_lcdif *lcdif)
+{
+	if (!lcdif->fb_info)
+		return;
+
+	if (lcdif->framebuffer_registered) {
+		unregister_framebuffer(lcdif->fb_info);
+		lcdif->framebuffer_registered = false;
+	}
+
+	framebuffer_release(lcdif->fb_info);
+	lcdif->fb_info = NULL;
+}
+
+/*
+ * 把设备树时序转换成LCDIF v4寄存器值。
+ *
+ * 所有寄存器访问都必须发生在axi/disp_axi/pix时钟打开之后。NXP同代
+ * 驱动明确指出：在部分SoC上关闭pixel clock后访问LCDIF寄存器可能
+ * 导致总线挂起。
+ */
+static int av_lcdif_start_controller(struct av_lcdif *lcdif)
+{
+	const struct av_lcdif_timing *t = &lcdif->timing;
+	u32 ctrl;
+	u32 vdctrl0;
+	u32 vdctrl4;
+	u32 htotal;
+	u32 vtotal;
+	u32 run_state;
+
+	htotal = t->hactive + t->hfront_porch +
+		 t->hsync_len + t->hback_porch;
+	vtotal = t->vactive + t->vfront_porch +
+		 t->vsync_len + t->vback_porch;
+
+	/*
+	 * 先停止并清空控制寄存器，避免继承U-Boot可能留下的像素格式、
+	 * DMA地址或运行状态。本项目已经先准备好新显存，因此屏幕可能在
+	 * 这里短暂闪烁，随后切换到颜色条。
+	 */
+	writel(0, lcdif->regs + LCDC_CTRL);
+	writel(0, lcdif->regs + LCDC_CTRL1);
+	writel(0, lcdif->regs + LCDC_V4_CTRL2);
+
+	/* 清理FIFO，再选择RGB565的16-bit字节打包。 */
+	writel(CTRL1_FIFO_CLEAR,
+	       lcdif->regs + LCDC_CTRL1 + REG_SET);
+	writel(CTRL1_SET_BYTE_PACKAGING(0xf),
+	       lcdif->regs + LCDC_CTRL1);
+
+	ctrl = CTRL_BYPASS_COUNT |
+	       CTRL_MASTER |
+	       CTRL_SET_BUS_WIDTH(STMLCDIF_24BIT) |
+	       CTRL_SET_WORD_LENGTH(STMLCDIF_WORD_LENGTH_16);
+	writel(ctrl, lcdif->regs + LCDC_CTRL);
+
+	writel(TRANSFER_COUNT_VCOUNT(t->vactive) |
+	       TRANSFER_COUNT_HCOUNT(t->hactive),
+	       lcdif->regs + LCDC_V4_TRANSFER_COUNT);
+
+	vdctrl0 = VDCTRL0_ENABLE_PRESENT |
+		  VDCTRL0_VSYNC_PERIOD_UNIT |
+		  VDCTRL0_VSYNC_PULSE_WIDTH_UNIT |
+		  VDCTRL0_VSYNC_PULSE_WIDTH(t->vsync_len);
+
+	if (t->hsync_active)
+		vdctrl0 |= VDCTRL0_HSYNC_ACT_HIGH;
+	if (t->vsync_active)
+		vdctrl0 |= VDCTRL0_VSYNC_ACT_HIGH;
+	if (t->de_active)
+		vdctrl0 |= VDCTRL0_ENABLE_ACT_HIGH;
+	if (!t->pixelclk_active)
+		vdctrl0 |= VDCTRL0_DOTCLK_ACT_FALLING;
+
+	writel(vdctrl0, lcdif->regs + LCDC_VDCTRL0);
+	writel(vtotal, lcdif->regs + LCDC_VDCTRL1);
+
+	writel(VDCTRL2_HSYNC_PULSE_WIDTH(t->hsync_len) |
+	       VDCTRL2_HSYNC_PERIOD(htotal),
+	       lcdif->regs + LCDC_VDCTRL2);
+
+	writel(VDCTRL3_HORIZONTAL_WAIT(t->hback_porch + t->hsync_len) |
+	       VDCTRL3_VERTICAL_WAIT(t->vback_porch + t->vsync_len),
+	       lcdif->regs + LCDC_VDCTRL3);
+
+	vdctrl4 = VDCTRL4_VALID_DATA_COUNT(t->hactive);
+	writel(vdctrl4, lcdif->regs + LCDC_VDCTRL4);
+
+	/*
+	 * i.MX6ULL是32-bit SoC，当前DMA地址落在32-bit物理地址空间。
+	 * 首次启动scanout_dma指向第0页；blank恢复时它保留停止前最后一次
+	 * 成功翻页的地址，因此不会强制跳回第0页。
+	 */
+	writel((u32)lcdif->scanout_dma,
+	       lcdif->regs + LCDC_V4_NEXT_BUF);
+
+	/* 提高AXI读取并发数，减少高分辨率扫描时的FIFO underflow。 */
+	writel(CTRL2_OUTSTANDING_REQS_16,
+	       lcdif->regs + LCDC_V4_CTRL2 + REG_SET);
+
+	/* 先开启DOTCLK和同步输出，最后置RUN启动DMA扫描。 */
+	writel(CTRL_DOTCLK_MODE,
+	       lcdif->regs + LCDC_CTRL + REG_SET);
+
+	vdctrl4 = readl(lcdif->regs + LCDC_VDCTRL4);
+	vdctrl4 |= VDCTRL4_SYNC_SIGNALS_ON;
+	writel(vdctrl4, lcdif->regs + LCDC_VDCTRL4);
+
+	writel(CTRL_MASTER,
+	       lcdif->regs + LCDC_CTRL + REG_SET);
+	writel(CTRL_RUN,
+	       lcdif->regs + LCDC_CTRL + REG_SET);
+	writel(CTRL1_RECOVERY_ON_UNDERFLOW,
+	       lcdif->regs + LCDC_CTRL1 + REG_SET);
+
+	/*
+	 * 第一次probe时IRQ尚未申请，不能提前拉高中断线。blank恢复时
+	 * irq_registered已经为true，可以在启动后恢复异常诊断中断。
+	 */
+	if (lcdif->irq_registered) {
+		writel(CTRL1_UNDERFLOW_IRQ | CTRL1_OVERFLOW_IRQ,
+		       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+		writel(CTRL1_UNDERFLOW_IRQ_EN | CTRL1_OVERFLOW_IRQ_EN,
+		       lcdif->regs + LCDC_CTRL1 + REG_SET);
+	}
+
+	/* 等待约3帧，再检查RUN和硬件当前扫描地址。 */
+	msleep(50);
+	run_state = readl(lcdif->regs + LCDC_CTRL);
+
+	dev_info(lcdif->dev,
+		 "LCDIF state: CTRL=0x%08x CUR_BUF=0x%08x NEXT_BUF=0x%08x\n",
+		 run_state,
+		 readl(lcdif->regs + LCDC_V4_CUR_BUF),
+		 readl(lcdif->regs + LCDC_V4_NEXT_BUF));
+
+	if (!(run_state & CTRL_RUN)) {
+		dev_err(lcdif->dev, "LCDIF RUN bit did not stay set\n");
+		writel(CTRL_RUN | CTRL_MASTER | CTRL_DOTCLK_MODE,
+		       lcdif->regs + LCDC_CTRL + REG_CLR);
+		vdctrl4 = readl(lcdif->regs + LCDC_VDCTRL4);
+		vdctrl4 &= ~VDCTRL4_SYNC_SIGNALS_ON;
+		writel(vdctrl4, lcdif->regs + LCDC_VDCTRL4);
+		return -EIO;
+	}
+
+	lcdif->controller_enabled = true;
+	return 0;
+}
+
+/*
+ * 停止顺序参考硬件扫描特点：
+ *   1. 清DOTCLK_MODE，请求控制器在FIFO排空后停止；
+ *   2. 等待RUN自动清零；
+ *   3. 超时也强制清RUN和MASTER，确保不再读取显存；
+ *   4. 关闭同步信号。
+ *
+ * 必须完成这些步骤后才能释放fb_dma，否则LCDIF可能继续读取已经归还
+ * 给内存管理器的物理页，造成花屏甚至破坏其他数据。
+ */
+static void av_lcdif_stop_controller(struct av_lcdif *lcdif)
+{
+	u32 vdctrl4;
+	u32 retry;
+
+	if (!lcdif->controller_enabled)
+		return;
+
+	/*
+	 * 先禁止并清除所有LCDIF中断，再等待已经进入CPU的handler退出。
+	 * 这样后面关闭时钟后，中断处理函数不会再访问已停钟的寄存器。
+	 */
+	writel(CTRL1_IRQ_ENABLE_MASK,
+	       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+	writel(CTRL1_IRQ_STATUS_MASK,
+	       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+	if (lcdif->irq_registered)
+		synchronize_irq(lcdif->irq);
+
+	writel(CTRL_DOTCLK_MODE,
+	       lcdif->regs + LCDC_CTRL + REG_CLR);
+
+	for (retry = 0; retry < AV_LCDIF_STOP_RETRIES; retry++) {
+		if (!(readl(lcdif->regs + LCDC_CTRL) & CTRL_RUN))
+			break;
+		udelay(1);
+	}
+
+	if (retry == AV_LCDIF_STOP_RETRIES)
+		dev_warn(lcdif->dev,
+			 "timeout waiting for LCDIF RUN to clear\n");
+
+	writel(CTRL_RUN | CTRL_MASTER,
+	       lcdif->regs + LCDC_CTRL + REG_CLR);
+
+	vdctrl4 = readl(lcdif->regs + LCDC_VDCTRL4);
+	vdctrl4 &= ~VDCTRL4_SYNC_SIGNALS_ON;
+	writel(vdctrl4, lcdif->regs + LCDC_VDCTRL4);
+
+	lcdif->controller_enabled = false;
+	dev_info(lcdif->dev, "LCDIF controller stopped\n");
+}
+
+/*
+ * 只读sysfs诊断节点：
+ *
+ *   /sys/bus/platform/devices/21c8000.lcdif/lcdif_stats
+ *
+ * 相比每帧printk，按需读取既不会扰动实时路径，也方便测试脚本保存
+ * 证据。state_lock保证blank/start修改寄存器时不会读到半配置状态。
+ */
+static ssize_t lcdif_stats_show(struct device *dev,
+				 struct device_attribute *attribute,
+				 char *buffer)
+{
+	struct av_lcdif *lcdif = dev_get_drvdata(dev);
+	u32 ctrl;
+	u32 ctrl1;
+	u32 cur_buf;
+	u32 next_buf;
+	ssize_t length;
+
+	(void)attribute;
+	if (!lcdif)
+		return -ENODEV;
+
+	mutex_lock(&lcdif->state_lock);
+	ctrl = readl(lcdif->regs + LCDC_CTRL);
+	ctrl1 = readl(lcdif->regs + LCDC_CTRL1);
+	cur_buf = readl(lcdif->regs + LCDC_V4_CUR_BUF);
+	next_buf = readl(lcdif->regs + LCDC_V4_NEXT_BUF);
+
+	length = scnprintf(buffer, PAGE_SIZE,
+		"version=R5\n"
+		"controller=%s\n"
+		"blank_state=%d\n"
+		"scanout_dma=0x%08llx\n"
+		"ctrl=0x%08x\n"
+		"ctrl1=0x%08x\n"
+		"cur_buf=0x%08x\n"
+		"next_buf=0x%08x\n"
+		"flips=%u\n"
+		"vsync_waits=%u\n"
+		"underflows=%u\n"
+		"overflows=%u\n"
+		"blank_events=%u\n",
+		lcdif->controller_enabled ? "running" : "stopped",
+		lcdif->blank_state,
+		(unsigned long long)lcdif->scanout_dma,
+		ctrl, ctrl1, cur_buf, next_buf,
+		lcdif->completed_flips, lcdif->completed_vsyncs,
+		lcdif->underflows, lcdif->overflows,
+		lcdif->blank_events);
+	mutex_unlock(&lcdif->state_lock);
+
+	return length;
+}
+
+static DEVICE_ATTR(lcdif_stats, 0444, lcdif_stats_show, NULL);
+
+static int av_lcdif_probe(struct platform_device *pdev)
+{
+	struct av_lcdif *lcdif;
+	struct resource *res;
+	struct pinctrl *pinctrl;
+	int ret;
+
+	dev_info(&pdev->dev, "LCD-R5 probe begin\n");
+
+	lcdif = devm_kzalloc(&pdev->dev, sizeof(*lcdif), GFP_KERNEL);
+	if (!lcdif)
+		return -ENOMEM;
+
+	lcdif->dev = &pdev->dev;
+	init_completion(&lcdif->flip_complete);
+	init_completion(&lcdif->vsync_complete);
+	mutex_init(&lcdif->flip_lock);
+	mutex_init(&lcdif->vsync_lock);
+	mutex_init(&lcdif->state_lock);
+	lcdif->blank_state = FB_BLANK_UNBLANK;
+	platform_set_drvdata(pdev, lcdif);
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res) {
+		dev_err(&pdev->dev, "missing LCDIF register resource\n");
+		return -ENODEV;
+	}
+
+	lcdif->regs = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(lcdif->regs)) {
+		ret = PTR_ERR(lcdif->regs);
+		dev_err(&pdev->dev, "failed to map registers: %d\n", ret);
+		return ret;
+	}
+
+	lcdif->irq = platform_get_irq(pdev, 0);
+	if (lcdif->irq < 0) {
+		dev_err(&pdev->dev, "missing LCDIF irq: %d\n", lcdif->irq);
+		return lcdif->irq;
+	}
+
+	pinctrl = devm_pinctrl_get_select_default(&pdev->dev);
+	if (IS_ERR(pinctrl)) {
+		ret = PTR_ERR(pinctrl);
+		dev_err(&pdev->dev,
+			"failed to select default pinctrl state: %d\n", ret);
+		return ret;
+	}
+
+	lcdif->clk_pix = devm_clk_get(&pdev->dev, "pix");
+	if (IS_ERR(lcdif->clk_pix)) {
+		ret = PTR_ERR(lcdif->clk_pix);
+		dev_err(&pdev->dev, "failed to get pix clock: %d\n", ret);
+		return ret;
+	}
+
+	lcdif->clk_axi = devm_clk_get(&pdev->dev, "axi");
+	if (IS_ERR(lcdif->clk_axi)) {
+		ret = PTR_ERR(lcdif->clk_axi);
+		dev_err(&pdev->dev, "failed to get axi clock: %d\n", ret);
+		return ret;
+	}
+
+	lcdif->clk_disp_axi = devm_clk_get(&pdev->dev, "disp_axi");
+	if (IS_ERR(lcdif->clk_disp_axi)) {
+		ret = PTR_ERR(lcdif->clk_disp_axi);
+		dev_err(&pdev->dev,
+			"failed to get disp_axi clock: %d\n", ret);
+		return ret;
+	}
+
+	ret = av_lcdif_parse_display(pdev, lcdif);
+	if (ret)
+		return ret;
+
+	ret = av_lcdif_alloc_framebuffer(lcdif);
+	if (ret)
+		return ret;
+
+	ret = av_lcdif_enable_clocks(lcdif);
+	if (ret)
+		goto free_framebuffer;
+
+	ret = av_lcdif_start_controller(lcdif);
+	if (ret)
+		goto stop_controller;
+
+	/*
+	 * start_controller已经把CTRL1中断使能清零，因此现在申请IRQ不会
+	 * 接收到U-Boot遗留事件。真正的帧完成/VSYNC中断按ioctl一次性开启。
+	 */
+	ret = devm_request_irq(&pdev->dev, lcdif->irq,
+			       av_lcdif_irq_handler, 0,
+			       dev_name(&pdev->dev), lcdif);
+	if (ret) {
+		dev_err(&pdev->dev,
+			"failed to request irq %d: %d\n", lcdif->irq, ret);
+		goto stop_controller;
+	}
+	lcdif->irq_registered = true;
+
+	/* 清除申请IRQ前可能积累的旧状态，再常开两类异常诊断中断。 */
+	writel(CTRL1_UNDERFLOW_IRQ | CTRL1_OVERFLOW_IRQ,
+	       lcdif->regs + LCDC_CTRL1 + REG_CLR);
+	writel(CTRL1_UNDERFLOW_IRQ_EN | CTRL1_OVERFLOW_IRQ_EN,
+	       lcdif->regs + LCDC_CTRL1 + REG_SET);
+
+	ret = av_lcdif_register_framebuffer(lcdif);
+	if (ret)
+		goto stop_controller;
+
+	ret = device_create_file(&pdev->dev, &dev_attr_lcdif_stats);
+	if (ret) {
+		dev_err(&pdev->dev,
+			"failed to create lcdif_stats: %d\n", ret);
+		goto unregister_framebuffer;
+	}
+	lcdif->stats_file_created = true;
+
+	dev_info(&pdev->dev,
+		 "LCD-R5 ready: final framebuffer and diagnostics available\n");
+	return 0;
+
+unregister_framebuffer:
+	av_lcdif_publish_blank(lcdif->fb_info, FB_BLANK_POWERDOWN);
+	av_lcdif_unregister_framebuffer(lcdif);
+stop_controller:
+	av_lcdif_stop_controller(lcdif);
+	av_lcdif_disable_clocks(lcdif);
+free_framebuffer:
+	av_lcdif_free_framebuffer(lcdif);
+	return ret;
+}
+
+static int av_lcdif_remove(struct platform_device *pdev)
+{
+	struct av_lcdif *lcdif = platform_get_drvdata(pdev);
+
+	/*
+	 * 先删除sysfs入口并从fbdev core注销，阻止新用户进入；然后停止
+	 * DMA、关闭寄存器访问所需的时钟，最后释放Framebuffer物理页。
+	 */
+	if (lcdif->stats_file_created) {
+		device_remove_file(&pdev->dev, &dev_attr_lcdif_stats);
+		lcdif->stats_file_created = false;
+	}
+
+	/*
+	 * 注销fbdev前发布POWERDOWN事件：先由本驱动停扫描，再由
+	 * backlight notifier关闭PWM，避免卸载后留下无图像的亮屏。
+	 */
+	if (lcdif->fb_info && lcdif->framebuffer_registered)
+		av_lcdif_publish_blank(lcdif->fb_info,
+				      FB_BLANK_POWERDOWN);
+
+	av_lcdif_unregister_framebuffer(lcdif);
+	av_lcdif_stop_controller(lcdif);
+	av_lcdif_disable_clocks(lcdif);
+	av_lcdif_free_framebuffer(lcdif);
+
+	platform_set_drvdata(pdev, NULL);
+	dev_info(&pdev->dev,
+		 "LCD-R5 remove complete: flips=%u, vsync=%u, "
+		 "underflow=%u, overflow=%u, blank=%u\n",
+		 lcdif->completed_flips, lcdif->completed_vsyncs,
+		 lcdif->underflows, lcdif->overflows,
+		 lcdif->blank_events);
+	return 0;
+}
+
+static void av_lcdif_shutdown(struct platform_device *pdev)
+{
+	struct av_lcdif *lcdif = platform_get_drvdata(pdev);
+
+	/*
+	 * reboot/poweroff时停止LCDIF并通知PWM背光关闭，避免控制器在
+	 * BootROM重新采样启动引脚期间继续访问旧显存。正常模块卸载仍
+	 * 走remove完整释放。
+	 */
+	if (lcdif->fb_info && lcdif->framebuffer_registered)
+		av_lcdif_publish_blank(lcdif->fb_info,
+				      FB_BLANK_POWERDOWN);
+	else
+		av_lcdif_stop_controller(lcdif);
+}
+
+static const struct of_device_id av_lcdif_of_match[] = {
+	{ .compatible = "fsl,imx6ul-lcdif" },
+	{ .compatible = "fsl,imx28-lcdif" },
+	{ /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, av_lcdif_of_match);
+
+static struct platform_driver av_lcdif_driver = {
+	.probe = av_lcdif_probe,
+	.remove = av_lcdif_remove,
+	.shutdown = av_lcdif_shutdown,
+	.driver = {
+		.name = AV_LCDIF_DRIVER_NAME,
+		.of_match_table = av_lcdif_of_match,
+	},
+};
+
+module_platform_driver(av_lcdif_driver);
+
+MODULE_AUTHOR("IMX6ULL_AV_Project");
+MODULE_DESCRIPTION("i.MX6ULL LCDIF learning framebuffer driver - LCD-R5");
+MODULE_LICENSE("GPL");
+MODULE_VERSION("R5");
